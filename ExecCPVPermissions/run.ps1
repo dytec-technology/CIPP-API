@@ -4,64 +4,41 @@ using namespace System.Net
 param($Request, $TriggerMetadata)
 
 $APIName = $TriggerMetadata.FunctionName
-Write-LogMessage -user $request.headers.'x-ms-client-principal' -API $APINAME  -message "Accessed this API" -Sev "Debug"
+Write-LogMessage -user $request.headers.'x-ms-client-principal' -API $APINAME -message 'Accessed this API' -Sev 'Debug'
 
 
 # Write to the Azure Functions log stream.
-Write-Host "PowerShell HTTP trigger function processed a request."
+Write-Host 'PowerShell HTTP trigger function processed a request.'
+$TenantFilter = (get-tenants -IncludeAll -IncludeErrors | Where-Object -Property customerId -EQ $Request.query.Tenantfilter).defaultDomainName
+Write-Host "Our Tenantfilter is $TenantFilter"
 
-# Interact with query parameters or the body of the request.
-$TenantFilter = $Request.Query.TenantFilter
-Set-Location (Get-Item $PSScriptRoot).Parent.FullName
-
-$Translator = Get-Content '.\Cache_SAMSetup\PermissionsTranslator.json' | ConvertFrom-Json
-$ExpectedPermissions = Get-Content '.\Cache_SAMSetup\SAMManifest.json' | ConvertFrom-Json
-try {
-    $DeleteOldPermissions = New-GraphpostRequest -Type DELETE -noauthcheck $true -uri "https://api.partnercenter.microsoft.com/v1/customers/$($TenantFilter)/applicationconsents/$($env:ApplicationID)" -scope "https://api.partnercenter.microsoft.com/.default" -tenantid $env:TenantID
-
+$CPVConsentParams = @{
+    Tenantfilter = $TenantFilter
 }
-catch {
-    "no old permissions to delete, moving on"
+if ($Request.Query.ResetSP -eq 'true') {
+    $CPVConsentParams.ResetSP = $true
 }
 
-$GraphRequest = $ExpectedPermissions.requiredResourceAccess | ForEach-Object { 
-    try {
-        $Resource = $_
-        $Permissionsname = switch ($Resource.ResourceAppId) {
-            '00000002-0000-0ff1-ce00-000000000000' { 'Office 365 Exchange Online' }
-            '00000003-0000-0000-c000-000000000000' { "Graph API" }
-            'fc780465-2017-40d4-a0c5-307022471b92' { 'WindowsDefenderATP' }
-            '00000003-0000-0ff1-ce00-000000000000' { 'Sharepoint' }
-            '48ac35b8-9aa8-4d74-927d-1f4a14a0b239' { 'Skype and Teams Tenant Admin API' }
-        }
-        $Scope = ($Translator | Where-Object { $_.id -in $Resource.ResourceAccess.id } | Where-Object { $_.value -notin 'profile', 'openid', 'offline_access' }).value -join ', '
-        if ($Scope) {
-            $RequiredCPVPerms = [PSCustomObject]@{
-                EnterpriseApplicationId = $_.ResourceAppId
-                Scope                   = "$Scope"
-            }
-            $AppBody = @"
-{
-  "ApplicationGrants":[ $(ConvertTo-Json -InputObject $RequiredCPVPerms -Compress -Depth 10)],
-  "ApplicationId": "$($env:ApplicationID)",
-  "DisplayName": "CIPP-SAM"
-}
-"@
-            $CPVConsent = New-GraphpostRequest -body $AppBody -Type POST -noauthcheck $true -uri "https://api.partnercenter.microsoft.com/v1/customers/$($TenantFilter)/applicationconsents" -scope "https://api.partnercenter.microsoft.com/.default" -tenantid $env:TenantID
-            "Succesfully set CPV permissions for $Permissionsname"
-
-        } 
-    }
-    catch {
-        Write-LogMessage -user $request.headers.'x-ms-client-principal' -API $APINAME  -message "Could not set CPV permissions for $PermissionsName. Does the Tenant have a license for this API. error: $($_.Exception.message)" -Sev "Error"
-        "Could not set CPV permissions for $PermissionsName. Does the Tenant have a license for this API? Error: $($_.Exception.message)"
-    }
+$GraphRequest = try {
+    Set-CIPPCPVConsent @CPVConsentParams
+    Add-CIPPApplicationPermission -RequiredResourceAccess 'CippDefaults' -ApplicationId $ENV:ApplicationID -tenantfilter $TenantFilter
+    Add-CIPPDelegatedPermission -RequiredResourceAccess 'CippDefaults' -ApplicationId $ENV:ApplicationID -tenantfilter $TenantFilter
+    $Success = $true
+} catch {
+    "Failed to update permissions for $($TenantFilter): $($_.Exception.Message)"
+    $Success = $false
 }
 
-$StatusCode = [HttpStatusCode]::OK
+$Tenant = Get-Tenants -IncludeAll -IncludeErrors | Where-Object -Property defaultDomainName -EQ $Tenantfilter
 
 # Associate values to output bindings by calling 'Push-OutputBinding'.
 Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
-        StatusCode = $StatusCode
-        Body       = @($GraphRequest)
+        StatusCode = [HttpStatusCode]::OK
+        Body       = @{
+            Results  = $GraphRequest
+            Metadata = @{
+                Heading = 'CPV Permission - {0} ({1})' -f $Tenant.displayName, $Tenant.defaultDomainName
+                Success = $Success
+            }
+        }
     })
